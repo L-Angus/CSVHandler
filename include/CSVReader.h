@@ -5,28 +5,52 @@
 #ifndef CSV_CSVREADER_H
 #define CSV_CSVREADER_H
 
-#include <any>
 #include <atomic>
 #include <fstream>
 #include <future>
+#include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
-#include "ThreadSafeQueue.hpp"
 #include "ThreadPool.hpp"
+#include "ThreadSafeQueue.hpp"
 
 // #define CSV_NO_THREAD
 
-using CSVRow = std::vector<std::string>;
-using CSVRowData = std::vector<CSVRow>;
-constexpr size_t ChunkDataSize = 4096*4;
+constexpr size_t ChunkDataSize = 4096 * 4;
+
+namespace LineParser {
+inline std::vector<std::string_view> SplitLine(std::string_view str,
+                                               const char &ch) {
+  std::vector<std::string_view> tmp;
+  tmp.reserve(str.size() / 2); // 预分配内存
+  size_t start = 0;
+  for (size_t pos = 0; pos < str.size(); ++pos) {
+    if (str[pos] == ch) {
+      if (pos - start > 1)
+        tmp.emplace_back(str.substr(start, pos - start)); // 插入子串
+      start = pos + 1;
+    }
+  }
+  if (start < str.size())
+    tmp.emplace_back(str.substr(start, str.size() - start)); // 插入子串
+  tmp.shrink_to_fit(); // 释放剩余内存
+  return tmp;
+}
+
+inline std::string_view SplitFirstChunk(std::string_view str, const char &ch) {
+  auto pos = str.find_first_of(ch);
+  return str.substr(0, pos);
+}
+}; // namespace LineParser
 
 class BaseIO {
 public:
@@ -46,39 +70,29 @@ private:
   std::istream &m_in;
 };
 
-class DataWrapper {
-public:
-  CSVRow operator()(std::string_view line, char quote = ',') {
-    CSVRow row;
-    size_t start = 0;
-    size_t end = line.find(quote);
-    while (end != std::string::npos) {
-      row.emplace_back(std::string_view(line.data() + start, end - start));
-      start = end + 1;
-      end = line.find(quote, start);
-    }
-    row.emplace_back(
-        std::string_view(line.data() + start, line.size() - start));
-    return row;
-  }
-};
+using CSVRow = std::vector<std::string_view>;
 
 #ifdef CSV_NO_THREAD
 
 class SyncReader {
 public:
   void Init(std::unique_ptr<BaseIO> io, size_t file_size);
-  void Read();
-  [[nodiscard]] CSVRowData GetCSVRow() const { return m_rows; }
+  void ReadDataFromCSV();
+  size_t GetDataSize() const noexcept { return m_csv_data.size(); }
+  [[nodiscard]] std::vector<CSVRow> GetCSVData() const { return m_csv_data; }
+  void SetColumnNames(const std::vector<std::string_view> &cols);
 
 private:
-  bool ReadChunkData();
-  [[nodiscard]] bool HasNextLine() const;
-  CSVRowData m_rows;
+  void ParseRows();
+  void ParseColumns();
+  bool CheckColumnNames();
   std::unique_ptr<BaseIO> m_source_io = nullptr;
   size_t m_total_byte_size = 0;
-  size_t m_read_byte_size = 0;
-  std::string m_remained_data;
+  std::string m_reading_buffer;
+  std::string m_header_line;
+  CSVRow m_rows;
+  CSVRow m_column_names;
+  std::vector<CSVRow> m_csv_data;
 };
 
 #else
@@ -87,24 +101,22 @@ private:
 class AsyncReader {
 public:
   void Init(std::unique_ptr<BaseIO> io, size_t file_size);
-  void Read();
-  [[nodiscard]] CSVRowData GetCSVRow() const { return m_rows; }
+  void ReadDataFromCSV();
+  size_t GetDataSize() const noexcept { return m_csv_data.size(); }
+  [[nodiscard]] std::vector<CSVRow> GetCSVData() const { return m_csv_data; }
+  void SetColumnNames(const std::vector<std::string_view>& cols);
 
 private:
-  void Producer(); // 生产者线程函数，负责从文件中读取数据并存入缓冲区
-  void Consumer(); // 消费者线程函数，负责从缓冲区中读取数据并解析为CSV行
-  [[nodiscard]] bool IsDone() const; // 判断是否读取完毕
+  void ParseRows();
+  void ParseColumns();
+  bool CheckColumnNames();
   std::unique_ptr<BaseIO> m_source_io = nullptr;
   size_t m_total_byte_size = 0;
-  size_t m_read_byte_size = 0;
-  std::string m_incomplete_line; // 缓存不完整行
-  std::mutex m_mutex;              // 互斥锁，用于保护缓冲区的访问
-  std::queue<std::string> m_queue; // 缓冲区
-  std::condition_variable m_not_full; // 条件变量，用于通知生产者缓冲区不满
-  std::condition_variable m_not_empty; // 条件变量，用于通知消费者缓冲区不空
-  std::thread m_producer_thread; // 生产者线程
-  std::thread m_consumer_thread; // 消费者线程
-  CSVRowData m_rows;             // 存储CSV行的数据
+  std::string m_reading_buffer;
+  std::string m_header_line;
+  CSVRow m_rows;
+  CSVRow m_column_names;
+  std::vector<CSVRow> m_csv_data; // 存储CSV数据
   std::promise<void> m_exception;
 };
 
@@ -123,13 +135,29 @@ public:
   CSVReader &operator=(const CSVReader &) = delete;
   ~CSVReader();
 
-  void Read(const std::string &csv);
-  CSVRowData GetRows() const { return reader.GetCSVRow(); }
+  template <typename... Args> explicit CSVReader(Args &&...args) {
+    SetColumnNames(std::forward<Args>(args)...);
+  }
+  template <typename... Args> void SetColumnNames(Args &&...args) {
+    std::initializer_list<std::string_view> columns{
+        std::forward<Args>(args)...};
+    if (columns.size() == 0)
+      throw std::invalid_argument("No column names provided");
+    // 检查column name是否重名,set会自动去重，检查size即可
+    std::set<std::string_view> unique_column(columns.begin(), columns.end());
+    if (unique_column.size() < columns.size())
+      throw std::invalid_argument("Duplicate column names found");
+    std::vector<std::string_view> column_names(columns.begin(), columns.end());
+    reader.SetColumnNames(column_names);
+  }
+  void Read(std::string_view csv);
+  std::vector<CSVRow> GetCSVData() const { return reader.GetCSVData(); }
 
 private:
-  std::unique_ptr<BaseIO> OpenFile();
-  void CheckFileSize(std::ifstream &in);
+  std::unique_ptr<BaseIO> OpenFile(std::string_view csv);
   size_t GetSourceFileSize() const { return m_file_size; }
+  bool CheckFileIsCSV(std::string_view csv) const;
+
   std::string m_csv;
   std::ifstream m_file;
   size_t m_file_size = 0;

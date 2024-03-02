@@ -15,7 +15,7 @@ int main(int argc, char* argv[]) {
   }
 
   std::string filename = argv[1];
-  CSVReader reader;
+  CSVReader reader("ID", "Name",  "Score");
   auto start = std::chrono::high_resolution_clock::now();
   try {
     reader.Read(filename);
@@ -25,7 +25,8 @@ int main(int argc, char* argv[]) {
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
   std::cout << "Cost time: " << duration << "ms" << std::endl;
-  std::cout << "Total: " << reader.GetRows().size() << std::endl;
+  std::cout << "Total: " << reader.GetCSVData().size() << std::endl;
+  std::cout << "Column: " << reader.GetCSVData()[0].back()<< std::endl;
 
   return 0;
 }
