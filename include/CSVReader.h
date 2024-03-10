@@ -11,8 +11,6 @@
 #include <initializer_list>
 #include <iostream>
 #include <memory>
-#include <mutex>
-#include <queue>
 #include <set>
 #include <sstream>
 #include <string>
@@ -20,16 +18,48 @@
 #include <thread>
 #include <vector>
 
-#include "ThreadPool.hpp"
-#include "ThreadSafeQueue.hpp"
+#include "ExceptionManager.hpp"
 
-// #define CSV_NO_THREAD
+class BaseIO {
+public:
+  virtual size_t Read(char *buffer, size_t size) = 0;
+  virtual ~BaseIO() {}
+};
 
-constexpr size_t ChunkDataSize = 4096 * 4;
+class IStreamIO : public BaseIO {
+public:
+  IStreamIO(std::istream &stream) : m_stream(stream) {}
+  size_t Read(char *buffer, size_t size) override {
+    m_stream.read(buffer, size);
+    return m_stream.gcount();
+  }
 
-namespace LineParser {
-inline std::vector<std::string_view> SplitLine(std::string_view str,
-                                               const char &ch) {
+private:
+  std::istream &m_stream;
+};
+
+namespace CSVUtils {
+
+namespace FileOperations {
+std::unique_ptr<IStreamIO> OpenFileHandle(std::ifstream &in) {
+  if (!in.is_open())
+    throw ExceptionManager::FileOpenException();
+  return std::make_unique<IStreamIO>(in);
+}
+size_t CalcFileSize(std::ifstream &file) {
+  file.seekg(0, std::ios::end);
+  size_t size = file.tellg();
+  file.seekg(0, std::ios::beg);
+  return size;
+}
+bool CheckFileExtension(const std::string &filename,
+                        const std::string &extension) {
+  return filename.substr(filename.rfind('.') + 1) == extension;
+}
+}; // namespace FileOperations
+
+namespace ParseOperations {
+std::vector<std::string_view> SplitRow(std::string_view str, const char &ch) {
   std::vector<std::string_view> tmp;
   tmp.reserve(str.size() / 2); // 预分配内存
   size_t start = 0;
@@ -41,126 +71,262 @@ inline std::vector<std::string_view> SplitLine(std::string_view str,
     }
   }
   if (start < str.size())
-    tmp.emplace_back(str.substr(start, str.size() - start)); // 插入子串
-  tmp.shrink_to_fit(); // 释放剩余内存
+    tmp.emplace_back(str.substr(start, str.size() - start)); // 插入子串c
   return tmp;
 }
-
-inline std::string_view SplitFirstChunk(std::string_view str, const char &ch) {
+std::string_view SplitFirstRow(std::string_view str, const char &ch) {
   auto pos = str.find_first_of(ch);
   return str.substr(0, pos);
 }
-}; // namespace LineParser
+} // namespace ParseOperations
 
-class BaseIO {
+}; // namespace CSVUtils
+
+// 管理文件IO资源安全
+class FileHandle {
 public:
-  virtual size_t Read(char *buffer, int size) = 0;
-  virtual ~BaseIO() = default;
+  explicit FileHandle(const std::string &filename)
+      : m_filename(filename), m_file(filename, std::ios::binary) {
+    if (!m_file.is_open()) {
+      throw ExceptionManager::FileOpenException(filename);
+    }
+  }
+  ~FileHandle() {
+    if (m_file.is_open()) {
+      m_file.close();
+    }
+  }
+  std::ifstream &GetHandle() { return m_file; }
+  const std::string &GetHandleContext() const { return m_filename; }
+
+private:
+  std::ifstream m_file;
+  std::string m_filename;
 };
 
-class IStreamIO : public BaseIO {
+class FileManager {
 public:
-  explicit IStreamIO(std::istream &in) : m_in(in) {}
-  size_t Read(char *buffer, int size) override {
-    m_in.read(buffer, size);
-    return m_in.gcount();
+  explicit FileManager(const std::string &filename)
+      : m_fileHandle(std::make_unique<FileHandle>(filename)) {
+    OpenSourceFile(filename);
+  }
+  ~FileManager() = default;
+
+  std::unique_ptr<BaseIO> CreateFileHandler() {
+    return CSVUtils::FileOperations::OpenFileHandle(m_fileHandle->GetHandle());
+  }
+  size_t GetFileSize() const { return m_file_size; }
+  std::string GetFileName() const { return m_fileHandle->GetHandleContext(); }
+
+private:
+  void OpenSourceFile(const std::string &file) {
+    auto ok = CSVUtils::FileOperations::CheckFileExtension(file, "csv");
+    if (!ok)
+      throw ExceptionManager::FileIsInvalid(file);
+    if (!m_fileHandle)
+      throw ExceptionManager::FileOpenException(file);
+    m_file_size =
+        CSVUtils::FileOperations::CalcFileSize(m_fileHandle->GetHandle());
+  }
+
+  size_t m_file_size = 0;
+  std::unique_ptr<FileHandle> m_fileHandle = nullptr;
+};
+
+class ParserImpl {
+public:
+  void SetColumnNames(const std::vector<std::string_view> &column_names) {
+    m_column_names = column_names;
+  }
+
+  void ParseRows(const std::unique_ptr<BaseIO> &io, const size_t &size) {
+    Initialize();
+    m_read_buffer.resize(size);
+    io->Read(m_read_buffer.data(), size);
+    m_rows = CSVUtils::ParseOperations::SplitRow(m_read_buffer, '\n');
+  }
+
+  void ParseColumns(const std::vector<std::string_view> &rows) {
+    m_csv_data.reserve(rows.size());
+    size_t current_line_number = 0;
+    for (const auto &row : rows) {
+      ++current_line_number;
+      auto columns = CSVUtils::ParseOperations::SplitRow(row, ',');
+      // column size一致性校验
+      if (!m_column_names.empty() && !ValidateColumnCount(columns)) {
+        throw ExceptionManager::InvalidDataLine(current_line_number,
+                                                "Invalid columns");
+      }
+      m_csv_data.emplace_back(columns);
+    }
+  }
+
+  void AsyncParseColumns(const std::vector<std::string_view> &rows,
+                         size_t thread_nums) {
+    std::vector<std::thread> threads; // 创建一个线程向量，存储多个线程
+    std::atomic<size_t> counter(0); //创建一个原子计数器，用于记录当前处理的行数
+    m_csv_data.resize(rows.size()); // 一维数组的size初始化二维数组的size
+
+    auto CheckAndSplitRow2Columns = [this, &rows](size_t j) {
+      auto columns = CSVUtils::ParseOperations::SplitRow(rows.at(j), ',');
+      if (!m_column_names.empty() && !ValidateColumnCount(columns)) {
+        throw ExceptionManager::InvalidDataLine(j, "Invalid columns");
+      }
+      return std::vector(columns);
+    };
+
+    for (size_t i = 0; i < thread_nums; ++i) {
+      threads.emplace_back([this, &counter, &CheckAndSplitRow2Columns, &rows] {
+        while (true) {
+          size_t j = counter.fetch_add(1);
+          if (j >= rows.size())
+            break;
+          m_csv_data[j] = CheckAndSplitRow2Columns(j);
+        }
+      });
+    }
+    // 监听线程的完成情况
+    for (auto &t : threads) {
+      t.join();
+    }
+  }
+
+  std::vector<std::vector<std::string_view>> GetCSVData() const {
+    return m_csv_data;
+  }
+  size_t GetDataSize() const { return m_csv_data.size(); }
+  std::vector<std::string_view> GetRowData() const { return m_rows; }
+
+private:
+  bool ValidateColumnCount(const std::vector<std::string_view> &columns) {
+    m_header_line =
+        CSVUtils::ParseOperations::SplitFirstRow(m_read_buffer, '\n');
+    m_column_names = CSVUtils::ParseOperations::SplitRow(m_header_line, ',');
+    return columns.size() == m_column_names.size();
+  }
+
+  void Initialize() {
+    m_header_line = "";
+    m_read_buffer = "";
+    m_column_names.clear();
+    m_csv_data.clear();
+    m_rows.clear();
+  }
+
+  std::string m_header_line;
+  std::string m_read_buffer;
+  std::vector<std::string_view> m_column_names;
+  std::vector<std::string_view> m_rows;
+  std::vector<std::vector<std::string_view>> m_csv_data;
+};
+
+class ParserStrategy {
+public:
+  ParserStrategy() : m_impl(std::make_unique<ParserImpl>()) {}
+  virtual ~ParserStrategy() = default;
+
+  virtual void ParseDataFromCSV(const std::unique_ptr<BaseIO> &io,
+                                const size_t &size) = 0;
+
+  void SetColumnNames(const std::vector<std::string_view> &columns) {
+    m_impl->SetColumnNames(columns);
+  }
+
+  std::vector<std::vector<std::string_view>> GetCSVData() const {
+    return m_impl->GetCSVData();
+  }
+
+  size_t GetCSVDataSize() const noexcept { return m_impl->GetDataSize(); }
+
+protected:
+  std::unique_ptr<ParserImpl> m_impl = nullptr;
+};
+
+class SynchronousParser : public ParserStrategy {
+public:
+  virtual void ParseDataFromCSV(const std::unique_ptr<BaseIO> &io,
+                                const size_t &size) override {
+    m_impl->ParseRows(std::move(io), size);
+    m_impl->ParseColumns(m_impl->GetRowData());
+  }
+};
+
+class AsynchronousParser : public ParserStrategy {
+public:
+  AsynchronousParser(size_t thread_num = std::thread::hardware_concurrency())
+      : m_thread_num(thread_num) {}
+
+  virtual void ParseDataFromCSV(const std::unique_ptr<BaseIO> &io,
+                                const size_t &size) override {
+    m_impl->ParseRows(std::move(io), size);
+    m_impl->AsyncParseColumns(m_impl->GetRowData(), m_thread_num);
   }
 
 private:
-  std::istream &m_in;
+  size_t m_thread_num = 0;
 };
 
-using CSVRow = std::vector<std::string_view>;
+enum class ParseMode { Synchronous, Asynchronous };
 
-#ifdef CSV_NO_THREAD
-
-class SyncReader {
+class CSVParser {
 public:
-  void Init(std::unique_ptr<BaseIO> io, size_t file_size);
-  void ReadDataFromCSV();
-  size_t GetDataSize() const noexcept { return m_csv_data.size(); }
-  [[nodiscard]] std::vector<CSVRow> GetCSVData() const { return m_csv_data; }
-  void SetColumnNames(const std::vector<std::string_view> &cols);
+  CSVParser() = default;
+  CSVParser(const CSVParser &) = delete;
+  CSVParser &operator=(const CSVParser &) = delete;
+  ~CSVParser() = default;
 
-private:
-  void ParseRows();
-  void ParseColumns();
-  bool CheckColumnNames();
-  std::unique_ptr<BaseIO> m_source_io = nullptr;
-  size_t m_total_byte_size = 0;
-  std::string m_reading_buffer;
-  std::string m_header_line;
-  CSVRow m_rows;
-  CSVRow m_column_names;
-  std::vector<CSVRow> m_csv_data;
-};
-
-#else
-
-/****************** AsyncReader ******************/
-class AsyncReader {
-public:
-  void Init(std::unique_ptr<BaseIO> io, size_t file_size);
-  void ReadDataFromCSV();
-  size_t GetDataSize() const noexcept { return m_csv_data.size(); }
-  [[nodiscard]] std::vector<CSVRow> GetCSVData() const { return m_csv_data; }
-  void SetColumnNames(const std::vector<std::string_view>& cols);
-
-private:
-  void ParseRows();
-  void ParseColumns();
-  bool CheckColumnNames();
-  std::unique_ptr<BaseIO> m_source_io = nullptr;
-  size_t m_total_byte_size = 0;
-  std::string m_reading_buffer;
-  std::string m_header_line;
-  CSVRow m_rows;
-  CSVRow m_column_names;
-  std::vector<CSVRow> m_csv_data; // 存储CSV数据
-  std::promise<void> m_exception;
-};
-
-#endif
-
-class CSVReader {
-#ifndef CSV_NO_THREAD
-  AsyncReader reader;
-#else
-  SyncReader reader;
-#endif
-
-public:
-  CSVReader() = default;
-  CSVReader(const CSVReader &) = delete;
-  CSVReader &operator=(const CSVReader &) = delete;
-  ~CSVReader();
-
-  template <typename... Args> explicit CSVReader(Args &&...args) {
-    SetColumnNames(std::forward<Args>(args)...);
+  template <typename... Args>
+  explicit CSVParser(ParseMode mode, Args &&...args) {
+    SetParser(mode);
+    if constexpr (sizeof...(Args) > 0) { // 检查Args是否有参数
+      SetColumnNames(std::forward<Args>(args)...);
+    }
   }
+
   template <typename... Args> void SetColumnNames(Args &&...args) {
     std::initializer_list<std::string_view> columns{
         std::forward<Args>(args)...};
     if (columns.size() == 0)
-      throw std::invalid_argument("No column names provided");
+      throw ExceptionManager::InvalidHeaderLine("No column names provided");
     // 检查column name是否重名,set会自动去重，检查size即可
     std::set<std::string_view> unique_column(columns.begin(), columns.end());
     if (unique_column.size() < columns.size())
-      throw std::invalid_argument("Duplicate column names found");
+      throw ExceptionManager::InvalidHeaderLine("Duplicate column names found");
     std::vector<std::string_view> column_names(columns.begin(), columns.end());
-    reader.SetColumnNames(column_names);
+    m_parser->SetColumnNames(column_names);
   }
-  void Read(std::string_view csv);
-  std::vector<CSVRow> GetCSVData() const { return reader.GetCSVData(); }
+
+  void SetParser(ParseMode mode) {
+    switch (mode) {
+    case ParseMode::Synchronous:
+      m_parser = std::make_unique<SynchronousParser>();
+      break;
+    case ParseMode::Asynchronous:
+      m_parser = std::make_unique<AsynchronousParser>();
+      break;
+    default:
+      throw std::runtime_error("Unsupported parse mode.");
+    }
+  }
+
+  void ParseDataFromCSV(const std::string &filename) {
+    try {
+      auto fileManager = std::make_unique<FileManager>(filename);
+      auto fileHandler = fileManager->CreateFileHandler();
+      m_parser->ParseDataFromCSV(fileHandler, fileManager->GetFileSize());
+    } catch (const std::exception &e) {
+      std::cerr << "Error parsing CSV file: " << e.what() << std::endl;
+    }
+  }
+
+  std::vector<std::vector<std::string_view>> GetCSVData() const {
+    return m_parser->GetCSVData();
+  }
+
+  size_t GetCSVDataSize() const noexcept { return m_parser->GetCSVDataSize(); }
 
 private:
-  std::unique_ptr<BaseIO> OpenFile(std::string_view csv);
-  size_t GetSourceFileSize() const { return m_file_size; }
-  bool CheckFileIsCSV(std::string_view csv) const;
-
-  std::string m_csv;
-  std::ifstream m_file;
-  size_t m_file_size = 0;
+  std::unique_ptr<ParserStrategy> m_parser = nullptr;
 };
 
 #endif // CSV_CSVREADER_H
