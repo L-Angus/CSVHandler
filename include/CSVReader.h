@@ -74,9 +74,45 @@ std::vector<std::string_view> SplitRow(std::string_view str, const char &ch) {
     tmp.emplace_back(str.substr(start, str.size() - start)); // 插入子串c
   return tmp;
 }
+
+size_t GetFirstRowIndex(std::string_view str, const char &ch) {
+  return str.find_first_of(ch);
+}
+
 std::string_view SplitFirstRow(std::string_view str, const char &ch) {
-  auto pos = str.find_first_of(ch);
-  return str.substr(0, pos);
+  return str.substr(0, GetFirstRowIndex(str, ch));
+}
+
+std::vector<std::string_view> SplitRowSkipHeader(std::string_view str,
+                                                 const char &ch) {
+  size_t begin = GetFirstRowIndex(str, ch);
+  auto new_str = str.substr(begin + 1);
+  return SplitRow(new_str, ch);
+}
+
+template <typename Task>
+void ParallelProcess(const std::vector<std::string_view> &items,
+                     size_t thread_count, Task atomic_parallel_task) {
+
+  std::vector<std::thread> threads;
+  std::atomic<size_t> counter(0);
+  size_t size = items.size();
+
+  auto worker = [&counter, size, &atomic_parallel_task](size_t id) {
+    while (true) {
+      size_t i = counter.fetch_add(1);
+      if (i >= size) {
+        break;
+      }
+      atomic_parallel_task(i);
+    }
+  };
+  for (size_t i = 0; i < thread_count; ++i) {
+    threads.emplace_back(worker, i);
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
 }
 } // namespace ParseOperations
 
@@ -104,6 +140,8 @@ private:
   std::string m_filename;
 };
 
+using namespace CSVUtils;
+
 class FileManager {
 public:
   explicit FileManager(const std::string &filename)
@@ -113,37 +151,39 @@ public:
   ~FileManager() = default;
 
   std::unique_ptr<BaseIO> CreateFileHandler() {
-    return CSVUtils::FileOperations::OpenFileHandle(m_fileHandle->GetHandle());
+    return FileOperations::OpenFileHandle(m_fileHandle->GetHandle());
   }
   size_t GetFileSize() const { return m_file_size; }
   std::string GetFileName() const { return m_fileHandle->GetHandleContext(); }
 
 private:
   void OpenSourceFile(const std::string &file) {
-    auto ok = CSVUtils::FileOperations::CheckFileExtension(file, "csv");
+    auto ok = FileOperations::CheckFileExtension(file, "csv");
     if (!ok)
       throw ExceptionManager::FileIsInvalid(file);
     if (!m_fileHandle)
       throw ExceptionManager::FileOpenException(file);
-    m_file_size =
-        CSVUtils::FileOperations::CalcFileSize(m_fileHandle->GetHandle());
+    m_file_size = FileOperations::CalcFileSize(m_fileHandle->GetHandle());
   }
 
   size_t m_file_size = 0;
   std::unique_ptr<FileHandle> m_fileHandle = nullptr;
 };
 
+using Callback = std::function<void(const std::vector<std::string_view> &)>;
+
 class ParserImpl {
 public:
+  ParserImpl() { Initialize(); }
+
   void SetColumnNames(const std::vector<std::string_view> &column_names) {
     m_column_names = column_names;
   }
 
   void ParseRows(const std::unique_ptr<BaseIO> &io, const size_t &size) {
-    Initialize();
     m_read_buffer.resize(size);
     io->Read(m_read_buffer.data(), size);
-    m_rows = CSVUtils::ParseOperations::SplitRow(m_read_buffer, '\n');
+    m_rows = ParseOperations::SplitRowSkipHeader(m_read_buffer, '\n');
   }
 
   void ParseColumns(const std::vector<std::string_view> &rows) {
@@ -151,7 +191,7 @@ public:
     size_t current_line_number = 0;
     for (const auto &row : rows) {
       ++current_line_number;
-      auto columns = CSVUtils::ParseOperations::SplitRow(row, ',');
+      auto columns = ParseOperations::SplitRow(row, ',');
       // column size一致性校验
       if (!m_column_names.empty() && !ValidateColumnCount(columns)) {
         throw ExceptionManager::InvalidDataLine(current_line_number,
@@ -191,6 +231,108 @@ public:
     }
   }
 
+  void WriteToFile(const std::string &des_file_path) {
+    std::ofstream ofs(des_file_path, std::ios::out);
+    if (!ofs.is_open()) {
+      throw ExceptionManager::FileOpenException(des_file_path);
+    }
+    // 先写首行
+    for (const auto &column_name : m_column_names) {
+      ofs << column_name;
+      if (&column_name != &m_column_names.back()) {
+        ofs << ",";
+      }
+    }
+    ofs << std::endl;
+
+    // 写数据
+    for (const auto &row : m_csv_data) {
+      for (size_t i = 0; i < row.size(); ++i) {
+        ofs << row[i];
+        if (i != row.size() - 1) {
+          ofs << ",";
+        }
+      }
+      ofs << std::endl;
+    }
+    ofs.close();
+  }
+
+  void AsyncWriteToFile(const std::string &des_file_path, size_t thread_nums) {
+    std::ofstream ofs(des_file_path, std::ios::out);
+    if (!ofs.is_open()) {
+      throw ExceptionManager::FileOpenException(des_file_path);
+    }
+    // 先写首行
+    for (const auto &column_name : m_column_names) {
+      ofs << column_name;
+      if (&column_name != &m_column_names.back()) {
+        ofs << ",";
+      }
+    }
+    ofs << std::endl;
+
+    auto AsyncWriteStrategy = [this,
+                               &ofs](const std::vector<std::string_view> &row) {
+      std::mutex mtx;
+      std::scoped_lock gaurd(mtx);
+      for (size_t i = 0; i < row.size(); ++i) {
+        ofs << row[i];
+        if (i != row.size() - 1) {
+          ofs << ",";
+        }
+      }
+      ofs << std::endl;
+    };
+
+    // 多线程并行写数据
+    std::vector<std::thread> threads;
+    std::atomic<size_t> counter(0);
+    for (size_t i = 0; i < thread_nums; ++i) {
+      threads.emplace_back([this, &counter, &AsyncWriteStrategy] {
+        while (true) {
+          size_t j = counter.fetch_add(1);
+          if (j >= m_csv_data.size())
+            break;
+          AsyncWriteStrategy(m_csv_data[j]);
+        }
+      });
+    }
+    // 监听线程的完成情况
+    for (auto &t : threads) {
+      t.join();
+    }
+    ofs.close();
+  }
+
+  void AddRow(const std::vector<std::string_view> &rows) {
+    m_csv_data.emplace_back(rows);
+  }
+
+  void DeleteRow(size_t begin_index, size_t end_index,
+                 const std::string &search_string) {
+    auto it = FindRow(m_csv_data, search_string, begin_index, end_index);
+    if (it == m_csv_data.end())
+      throw std::runtime_error("Not find such search string: " + search_string);
+    m_csv_data.erase(it);
+  }
+
+  std::vector<std::string_view> FindRow(const std::string &search_string,
+                                        size_t begin_index, size_t end_index) {
+    auto it = FindRow(m_csv_data, search_string, begin_index, end_index);
+    if (it == m_csv_data.end())
+      throw std::runtime_error("Not find such row: " + search_string);
+    return *it;
+  }
+
+  void UpdateRow(const std::string &search_string, size_t begin_index,
+                 size_t end_index, const Callback &update_strategy) {
+    auto it = FindRow(m_csv_data, search_string, begin_index, end_index);
+    if (it == m_csv_data.end())
+      throw std::runtime_error("Not find such search string: " + search_string);
+    update_strategy(*it);
+  }
+
   std::vector<std::vector<std::string_view>> GetCSVData() const {
     return m_csv_data;
   }
@@ -198,10 +340,27 @@ public:
   std::vector<std::string_view> GetRowData() const { return m_rows; }
 
 private:
+  std::vector<std::vector<std::string_view>>::const_iterator
+  FindRow(const std::vector<std::vector<std::string_view>> &rows,
+          const std::string &search_string, size_t begin_index,
+          size_t end_index) const {
+    // 创建一个条件函数，该函数根据指定的列索引和搜索字符串生成
+    auto condition = [&](const std::vector<std::string_view> &row) -> bool {
+      // std::string_view search_substring = std::string_view();
+      std::string search_substring;
+      for (size_t i = 0; i < row.size(); ++i) {
+        // 拼接指定索引范围内的子字符串
+        if (i >= begin_index && i <= end_index) {
+          search_substring.append(row[i]);
+        }
+      }
+      return search_substring == search_string;
+    };
+    // 使用条件函数调用FindRow
+    return std::find_if(rows.begin(), rows.end(), condition);
+  }
+
   bool ValidateColumnCount(const std::vector<std::string_view> &columns) {
-    m_header_line =
-        CSVUtils::ParseOperations::SplitFirstRow(m_read_buffer, '\n');
-    m_column_names = CSVUtils::ParseOperations::SplitRow(m_header_line, ',');
     return columns.size() == m_column_names.size();
   }
 
@@ -228,15 +387,31 @@ public:
   virtual void ParseDataFromCSV(const std::unique_ptr<BaseIO> &io,
                                 const size_t &size) = 0;
 
+  virtual void WriteDataToCSV(const std::string &destination_path) = 0;
+
   void SetColumnNames(const std::vector<std::string_view> &columns) {
     m_impl->SetColumnNames(columns);
   }
-
   std::vector<std::vector<std::string_view>> GetCSVData() const {
     return m_impl->GetCSVData();
   }
-
   size_t GetCSVDataSize() const noexcept { return m_impl->GetDataSize(); }
+  void AddRowData(const std::vector<std::string_view> &new_row) {
+    m_impl->AddRow(new_row);
+  }
+  void DeleteRowData(size_t begin_index, size_t end_index,
+                     const std::string &search_string) {
+    m_impl->DeleteRow(begin_index, end_index, search_string);
+  }
+  void UpdateRowData(const std::string &search_string, size_t begin_index,
+                     size_t end_index, const Callback &update_strategy) {
+    m_impl->UpdateRow(search_string, begin_index, end_index, update_strategy);
+  }
+  std::vector<std::string_view> GetRowDataInfo(const std::string &search_string,
+                                               size_t begin_index,
+                                               size_t end_index) const {
+    return m_impl->FindRow(search_string, begin_index, end_index);
+  }
 
 protected:
   std::unique_ptr<ParserImpl> m_impl = nullptr;
@@ -248,6 +423,10 @@ public:
                                 const size_t &size) override {
     m_impl->ParseRows(std::move(io), size);
     m_impl->ParseColumns(m_impl->GetRowData());
+  }
+
+  virtual void WriteDataToCSV(const std::string &destination_path) override {
+    m_impl->WriteToFile(destination_path);
   }
 };
 
@@ -262,6 +441,11 @@ public:
     m_impl->AsyncParseColumns(m_impl->GetRowData(), m_thread_num);
   }
 
+  virtual void WriteDataToCSV(const std::string &destination_path) override {
+    // m_impl->AsyncWriteToFile(destination_path, m_thread_num);
+    m_impl->WriteToFile(destination_path);
+  }
+
 private:
   size_t m_thread_num = 0;
 };
@@ -269,6 +453,8 @@ private:
 enum class ParseMode { Synchronous, Asynchronous };
 
 class CSVParser {
+  using DataContainer = std::vector<std::vector<std::string_view>>;
+
 public:
   CSVParser() = default;
   CSVParser(const CSVParser &) = delete;
@@ -282,7 +468,6 @@ public:
       SetColumnNames(std::forward<Args>(args)...);
     }
   }
-
   template <typename... Args> void SetColumnNames(Args &&...args) {
     std::initializer_list<std::string_view> columns{
         std::forward<Args>(args)...};
@@ -295,7 +480,6 @@ public:
     std::vector<std::string_view> column_names(columns.begin(), columns.end());
     m_parser->SetColumnNames(column_names);
   }
-
   void SetParser(ParseMode mode) {
     switch (mode) {
     case ParseMode::Synchronous:
@@ -308,22 +492,36 @@ public:
       throw std::runtime_error("Unsupported parse mode.");
     }
   }
-
   void ParseDataFromCSV(const std::string &filename) {
-    try {
-      auto fileManager = std::make_unique<FileManager>(filename);
-      auto fileHandler = fileManager->CreateFileHandler();
-      m_parser->ParseDataFromCSV(fileHandler, fileManager->GetFileSize());
-    } catch (const std::exception &e) {
-      std::cerr << "Error parsing CSV file: " << e.what() << std::endl;
-    }
+    auto fileManager = std::make_unique<FileManager>(filename);
+    auto fileHandler = fileManager->CreateFileHandler();
+    m_parser->ParseDataFromCSV(fileHandler, fileManager->GetFileSize());
   }
-
-  std::vector<std::vector<std::string_view>> GetCSVData() const {
-    return m_parser->GetCSVData();
-  }
-
+  DataContainer GetCSVData() const { return m_parser->GetCSVData(); }
   size_t GetCSVDataSize() const noexcept { return m_parser->GetCSVDataSize(); }
+  void AddRowData(const std::vector<std::string_view> &row_data) {
+    m_parser->AddRowData(row_data);
+  }
+  void DeleteRowDataByColumns(size_t begin_index, size_t end_index,
+                              const std::string &search_string) {
+    m_parser->DeleteRowData(begin_index, end_index, search_string);
+  }
+  void UpdateRowDataByColumns(const std::string &search_string,
+                              size_t begin_index, size_t end_index,
+                              const Callback &update_strategy) {
+    m_parser->UpdateRowData(search_string, begin_index, end_index,
+                            update_strategy);
+  }
+  std::vector<std::string_view>
+  GetRowDataByColumns(const std::string &search_string, size_t begin_index,
+                      size_t end_index) {
+    return m_parser->GetRowDataInfo(search_string, begin_index, end_index);
+  }
+
+  void WriteCSVDataToFile(const std::string &filename) {
+    m_parser->WriteDataToCSV(filename);
+    std::cout << "Write CSV data to file: " << filename << std::endl;
+  }
 
 private:
   std::unique_ptr<ParserStrategy> m_parser = nullptr;
