@@ -16,7 +16,9 @@ int main(int argc, char *argv[]) {
   std::string filename = argv[1];
   // std::vector<std::string_view> files{filename, argv[2]};
   CSVParser parser(ParseMode::Asynchronous);
-  parser.SetColumnNames("ID", "Name", "Score");
+  // parser.SetColumnNames("ID", "Name", "Score");
+  parser.SetColumnNames("StimName", "StimType", "PinName", "Frequency", "Power",
+                        "WaveFile");
   auto start = std::chrono::high_resolution_clock::now();
   try {
     parser.ParseDataFromCSV(filename);
