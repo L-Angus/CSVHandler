@@ -66,7 +66,7 @@ std::vector<std::string_view> SplitRow(std::string_view str, const char &ch) {
   for (size_t pos = 0; pos < str.size(); ++pos) {
     if (str[pos] == ch ||
         (str[pos] == '\r' && pos + 1 < str.size() && str[pos + 1] == '\n')) {
-      if (pos - start > 1)
+      if (pos - start > 0)
         tmp.emplace_back(str.substr(start, pos - start)); // 插入子串
       if (str[pos] == ch || (str[pos] == '\r' && str[pos + 1] == '\n')) {
         start = pos + (str[pos] == '\r' ? 2 : 1);
@@ -75,7 +75,7 @@ std::vector<std::string_view> SplitRow(std::string_view str, const char &ch) {
     }
   }
   if (start < str.size())
-    tmp.emplace_back(str.substr(start, str.size() - start)); // 插入子串c
+    tmp.emplace_back(str.substr(start, str.size() - start)); // 插入子串
   return tmp;
 }
 
