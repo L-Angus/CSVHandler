@@ -24,18 +24,30 @@ int main(int argc, char *argv[]) {
   auto start = std::chrono::high_resolution_clock::now();
   try {
     parser.ParseDataFromCSV(filename);
+    std::vector<std::string_view> new_row = {"000011", "NewAdd", "88"};
+    // 实现添加操作
+    auto add_data = [&new_row](std::vector<std::vector<std::string_view>> &data) {
+      std::vector<std::string_view> row = {};
+      data.push_back(row);
+      std::cout << "Data added!" << std::endl;
+    };
+    parser.OnAdd(add_data);
   } catch (const std::exception &e) {
     std::cout << e.what() << std::endl;
   }
   // parser.WriteCSVDataToFile(argv[2]);
 
   auto end = std::chrono::high_resolution_clock::now();
-  auto duration =
-      std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
-          .count();
+  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
   std::cout << "Cost time: " << duration << "ms" << std::endl;
   std::cout << "Total: " << parser.GetCSVDataSize() << std::endl;
   // std::cout << "Column: " << parser.GetCSVData().back()[0] << std::endl;
+  for (const auto &row : parser.GetCSVData()) {
+    for (const auto &col : row) {
+      std::cout << col << " ";
+    }
+    std::cout << std::endl;
+  }
 
   return 0;
 }
